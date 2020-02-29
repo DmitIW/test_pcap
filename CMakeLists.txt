@@ -36,13 +36,13 @@ LINK_DIRECTORIES(${DPDK_BUILD_DIR}/lib)
 PROJECT(test_pcap)
 
 SET(SRC
-	main.c)
+		main.c)
 SET(CMAKE_C_FLAGS "-mssse3")
 
 ADD_EXECUTABLE(${CMAKE_PROJECT_NAME} ${SRC})
 TARGET_LINK_LIBRARIES(${CMAKE_PROJECT_NAME}
 	 -Wl,--whole-archive
-	rte_eal rte_mbuf rte_pmd_pcap rte_mempool rte_ethdev rte_kvargs rte_bus_vdev rte_ring rte_mempool_ring
+	rte_eal rte_mbuf rte_pmd_pcap rte_mempool rte_ethdev rte_kvargs rte_bus_vdev rte_ring rte_mempool_ring rte_hash
 
 	-Wl,--as-needed
 	-Wl,--no-whole-archive
