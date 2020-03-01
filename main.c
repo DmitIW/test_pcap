@@ -9,6 +9,7 @@
 #include <rte_ip.h>
 #include <rte_hash.h>
 
+#include "filter.h"
 //
 //  DPDK skeleton
 //
@@ -20,115 +21,12 @@
 #define MBUF_CACHE_SIZE 0
 #define BURST_SIZE 32
 
-struct tcp_flow_key {
-        uint32_t first_ip;
-        uint16_t first_port;
-        uint32_t second_ip;
-        uint16_t second_port;
-};
-static struct rte_hash* g_flows;
-enum HandshakePhase {
-    Qestion = 0x01u,
-    Answer = 0x02u,
-    Accept = 0x03u
-};
-struct tcp_flow_state {
-    enum HandshakePhase state;
-    uint8_t direction; // src ip < dst ip
-    uint32_t seq;
-    uint32_t ack;
-};
-struct rte_mempool* g_tcp_flow_state_pool = NULL;
 static const struct rte_eth_conf port_conf_default = {
     .rxmode = { .max_rx_pkt_len = ETHER_MAX_LEN }
 };
 
 /* basicfwd.c: Basic DPDK skeleton forwarding example. */
 
-static uint8_t analyze_hdr(struct tcp_hdr* tcp_header, struct tcp_flow_key* key, uint8_t direction) {
-
-    struct tcp_flow_state* flow_state;
-    int in_table = rte_hash_lookup_data(g_flows, key, (void**)&flow_state);
-    uint8_t syn = tcp_header->tcp_flags & 0x02u;
-    uint8_t brk = tcp_header->tcp_flags & 0x01u + tcp_header->tcp_flags & 0x04u;
-    uint32_t seq = htonl(tcp_header->sent_seq);
-    uint32_t ack = htonl(tcp_header->recv_ack);
-
-    if (in_table < 0) {
-        rte_mempool_get(g_tcp_flow_state_pool, (void**)&flow_state);
-        if (syn == 0)
-            return 0;
-        else {
-            flow_state->direction = direction;
-            flow_state->seq = tcp_header->sent_seq;
-            flow_state->ack = tcp_header->recv_ack;
-            flow_state->state = Qestion;
-            if (rte_hash_add_key_data(g_flows, key, flow_state) != 0)
-                printf("Warning: Trouble with adding state to flows hash table");
-            return 1;
-        }
-    } else {
-        return 1;
-//        switch (flow_state->state) {
-//            case Qestion:
-//                if (syn == 0 || direction == flow_state->direction || flow_state->seq + 1 != tcp_header->recv_ack)
-//                    return 0;
-//                flow_state->state = Answer;
-//                flow_state->direction = direction;
-//                flow_state->seq = tcp_header->sent_seq;
-//                flow_state->ack = tcp_header->recv_ack;
-//                return 1;
-//            case Answer:
-//                if (syn == 1 || direction == flow_state->direction || flow_state->seq + 1 != tcp_header->recv_ack
-//                             || flow_state->ack != tcp_header->sent_seq)
-//                    return 0;
-//                flow_state->state = Accept;
-//                return 1;
-//            case Accept:
-//                if (brk != 0) {
-//                    rte_hash_del_key(g_flows, key);
-//                    rte_mempool_put(g_tcp_flow_state_pool, flow_state);
-//                }
-//                return 1;
-//            default:
-//                printf("Warning: Unconditional header state");
-//                break;
-//        }
-    }
-}
-
-static inline uint8_t accept_tcp(struct rte_mbuf* m) {
-
-    struct ether_hdr* eth_header = rte_pktmbuf_mtod(m, struct ether_hdr*);
-
-    struct ipv4_hdr* ip_header = (struct ipv4_hdr*)((char*)eth_header + sizeof(struct ether_hdr));
-    uint32_t src_addr = ip_header->src_addr;
-    uint32_t dst_addr = ip_header->dst_addr;
-
-    struct tcp_hdr* tcp_header = (struct tcp_hdr*)((char*)ip_header + sizeof(struct ipv4_hdr));
-    uint16_t src_port = tcp_header->src_port;
-    uint16_t dst_port = tcp_header->dst_port;
-
-    uint8_t direction = src_addr < dst_addr;
-
-    struct tcp_flow_key key;
-    if (direction) {
-        key.first_ip = src_addr;
-        key.first_port = src_port;
-
-        key.second_ip = dst_addr;
-        key.second_port = dst_port;
-
-    } else {
-        key.first_ip = dst_addr;
-        key.first_port = dst_port;
-
-        key.second_ip = src_addr;
-        key.second_port = src_addr;
-    }
-
-    return analyze_hdr(tcp_header, &key, direction);
-}
 /*
  * Initializes a given port using global settings and with the RX buffers
  * coming from the mbuf_pool passed as a parameter.
@@ -249,7 +147,7 @@ lcore_main(void)
                 else
                     dropped_buffs[dropped++] = m;
             }
-            common_accepted += accepted;
+
             /* Send burst of TX packets, to second port of pair. */
             const uint16_t nb_tx = rte_eth_tx_burst(port, 0,
                     accepted_bufs, accepted);
@@ -269,7 +167,7 @@ lcore_main(void)
         } while (nb_rx);
         rte_eth_dev_stop(port);
     }
-    printf("Accepted count: %u\n", common_accepted);
+    print_stats();
 }
 
 /*
@@ -291,21 +189,11 @@ main(int argc, char *argv[])
     argc -= ret;
     argv += ret;
 
-    struct rte_hash_parameters hash_params = {
-            .entries = 64536,
-            .key_len = sizeof(struct tcp_flow_key),
-            .socket_id = (int)rte_socket_id(),
-            .hash_func_init_val = 0,
-            .name = "tcp flows table"
+    struct filter_settings settings = {
+        .flow_number = 65434
     };
-    g_flows = rte_hash_create(&hash_params);
-    if (g_flows == NULL)
-    {
-        rte_exit(EXIT_FAILURE, "No hash table created\n");
-    }
-    g_tcp_flow_state_pool = rte_mempool_create("tcp_state_pool", 65535, sizeof(struct tcp_flow_state),
-                                          0, 0, NULL, NULL,
-                                          NULL, NULL, (int)rte_socket_id(), 0);
+    init_filter(&settings);
+
     /* Check that there is an even number of ports to send/receive on. */
     nb_ports = rte_eth_dev_count();
     if (nb_ports < 1)

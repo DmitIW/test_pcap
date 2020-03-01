@@ -36,7 +36,7 @@ LINK_DIRECTORIES(${DPDK_BUILD_DIR}/lib)
 PROJECT(test_pcap)
 
 SET(SRC
-		main.c)
+		main.c filter.c filter.h)
 SET(CMAKE_C_FLAGS "-mssse3")
 
 ADD_EXECUTABLE(${CMAKE_PROJECT_NAME} ${SRC})
