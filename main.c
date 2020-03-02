@@ -123,7 +123,7 @@ lcore_main(void)
      */
     uint32_t common_accepted = 0;
     printf("NB_ports: %u\n", nb_ports);
-    for (port = 0; port < nb_ports; port++) {
+    for (port = 0; port < nb_ports - 1; port++) {
 
         uint16_t nb_rx;
 
@@ -153,17 +153,26 @@ lcore_main(void)
             const uint16_t nb_tx = rte_eth_tx_burst(port, 0,
                     accepted_bufs, accepted);
 
-            for (uint16_t buf = 0; buf < dropped; buf++)
-                rte_pktmbuf_free(dropped_buffs[buf]);
+            const uint16_t nb_tx_dropped = rte_eth_tx_burst(1, 0, dropped_buffs, dropped);
+//            for (uint16_t buf = 0; buf < dropped; buf++)
+//                rte_pktmbuf_free(dropped_buffs[buf]);
 
             /* Free any unsent packets. */
             if (unlikely(nb_tx < accepted)) {
                 uint16_t buf;
-                printf("WARNING, not transmitted packets: %d of %d\n",
+                printf("WARNING, not transmitted packets (accepted): %d of %d\n",
                        nb_tx - accepted,
                        accepted);
                 for (buf = nb_tx; buf < accepted; buf++)
-                    rte_pktmbuf_free(bufs[buf]);
+                    rte_pktmbuf_free(accepted_bufs[buf]);
+            }
+            if (unlikely(nb_tx_dropped < dropped)) {
+                uint16_t buf;
+                printf("WARNING, not transmitted packets (accepted): %d of %d\n",
+                       nb_tx_dropped - dropped,
+                       dropped);
+                for (buf = nb_tx; buf < dropped; buf++)
+                    rte_pktmbuf_free(dropped_buffs[buf]);
             }
         } while (nb_rx);
         rte_eth_dev_stop(port);
