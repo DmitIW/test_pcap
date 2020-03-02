@@ -1,7 +1,7 @@
 //#include "filter.h"
 
-#define ___DEBUG                     // Show stats for filter at end
-#define ___TEST                      // Run tests. Filter doesn't work in production, accept all packages
+//#define ___DEBUG                     // Show stats for filter at end
+//#define ___TEST                      // Run tests. Filter doesn't work in production, accept all packages
 //#define ___STRICT_FLAGS_EQUAL        // Check all flags in header or only important for handshake
 //#define ___BIDIRECTIONAL             // Analyze in context of bidirectional connection (clnt -> srvr and srvr -> clnt) or only clnt -> srvr
 //
