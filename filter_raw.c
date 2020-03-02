@@ -1,9 +1,9 @@
 //#include "filter.h"
 
-//#define ___DEBUG                     // Show stats for filter at end
-//#define ___TEST                      // Run tests. Filter doesn't work in production, accept all packages
-//#define ___STRICT_FLAGS_EQUAL        // Check all flags in header or only important for handshake
-//#define ___BIDIRECTIONAL             // Analyze in context of bidirectional connection (clnt -> srvr and srvr -> clnt) or only clnt -> srvr
+#define ___DEBUG                     // Show stats for filter at end
+#define ___TEST                      // Run tests. Filter doesn't work in production, accept all packages
+#define ___STRICT_FLAGS_EQUAL        // Check all flags in header or only important for handshake
+#define ___BIDIRECTIONAL             // Analyze in context of bidirectional connection (clnt -> srvr and srvr -> clnt) or only clnt -> srvr
 //
 // Support structs
 //
@@ -119,11 +119,9 @@ struct rte_mempool* fsm_states;          // for TCP handshake parsing
 struct fsm_transition {
     enum HandshakePhase phase;
     ACTIVE_FLAGS_TYPE active_flags;
-    // the first bit for "from client" check
-    // the second bit for SYN
-    // the third bit for RST
-    // the fourth bit for correct seq and ack values check
-    // the fifth bit for ACK
+    // first 6 bit for tcp flags
+    // 7 bit for direction
+    // 8 bit for chck flag
 };
 static inline void add_new_transition(enum HandshakePhase phase_from, ACTIVE_FLAGS_TYPE flags_from, enum HandshakePhase phase_to) {
     // Add new transition to FSM. FROM fstm_transition{phase_from, flags_from} TO phase_to

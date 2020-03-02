@@ -122,6 +122,7 @@ lcore_main(void)
      * port.
      */
     uint32_t common_accepted = 0;
+    printf("NB_ports: %u\n", nb_ports);
     for (port = 0; port < nb_ports; port++) {
 
         uint16_t nb_rx;

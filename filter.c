@@ -144,13 +144,13 @@ static void init_fsm() {
     add_new_transition(SYN_SENT_RECIPIENT_LOOP, 0x02u + CLNT, SYN_SENT_RECIPIENT);
     add_new_transition(SYN_SENT_RECIPIENT_LOOP, 0x10u + CLNT , ESTABLISHED);
 }
-
+#ifdef ___DEBUG
 static uint64_t without_transition = 0;
 static uint64_t dropped = 0;
 static uint64_t accepted = 0;
 static uint64_t established = 0;
 static uint64_t lost = 0;
-
+#endif
 
 static inline uint8_t get_next_state(struct fsm_transition* state) {
     // Try to get next state by using FSM transitions. Update get state->phase if next state exists and return 1, otherwise 0
@@ -188,7 +188,6 @@ static uint8_t analyze_hdr(struct tcp_hdr* tcp_header, struct tcp_flow_key* key,
 #endif
         return 1;
     }
-
     // analyze otherwise
     struct fsm_transition t = {
             .phase = flow_state->state,

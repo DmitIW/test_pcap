@@ -52,7 +52,7 @@ ADD_DEPENDENCIES(${CMAKE_PROJECT_NAME} dpdk)
 file(COPY ${CMAKE_SOURCE_DIR}/test_tcp.pcap DESTINATION ${CMAKE_BINARY_DIR})
 
 ADD_CUSTOM_TARGET(run
-	${CMAKE_PROJECT_NAME} --vdev 'net_pcap0,rx_pcap=test_tcp.pcap,tx_pcap=test_tcp_out.pcap' --no-huge
+	${CMAKE_PROJECT_NAME} --vdev 'net_pcap0,rx_pcap=test_tcp.pcap,tx_pcap=test_tcp_accepted.pcap' --no-huge
 	DEPENDS ${CMAKE_PROJECT_NAME}
 	WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
