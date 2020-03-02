@@ -1,16 +1,13 @@
 #include "filter.h"
 
-//
-// Support structs
-//
+//#define ___DEBUG
 
 enum HandshakePhase {
     LISTEN = 0x00U,
-    SYN_SENT_INITIATOR = 0x01u,
     SYN_SENT_RECIPIENT = 0x02u,
     ESTABLISHED = 0x03u,
     SKIP = 0x04u,
-    SYN_SENT_RECIPIENT_WOT_ACK = 0x05u
+    SYN_SENT_RECIPIENT_LOOP = 0x07u
 };
 struct tcp_flow_key {
     // first ip always smaller as number than second, direction of connect stored in value of hash table
@@ -21,19 +18,20 @@ struct tcp_flow_key {
 };
 struct tcp_flow_state {
     enum HandshakePhase state;
-    uint8_t first_to_second; // from first ip to second ip in hash key or inverse direction
+    uint16_t first_to_second; // from first ip to second ip in hash key or inverse direction
     uint32_t seq;            // last used seq value
     uint32_t ack;            // last used ack value
 };
-struct tcp_flags {
-    uint8_t SYN, ACK, RST;
-};
+#define CLNT 0x40u
+#define CHCK 0x80u
+#define ACTIVE_FLAGS_TYPE uint32_t
+
 //
 // Mem operations
 //
 
 struct rte_mempool* g_tcp_flow_state_pool = NULL;  // mempool for hash table values
-static inline void get_mem(struct tcp_flow_state** object)  { rte_mempool_get(g_tcp_flow_state_pool, (void**)object);}
+static inline void get_mem(struct tcp_flow_state** object) { rte_mempool_get(g_tcp_flow_state_pool, (void**)object);}
 static inline void free_mem(struct tcp_flow_state* object) { rte_mempool_put(g_tcp_flow_state_pool, object); }
 static void mempool_init(struct filter_settings* settings) {
     // Init mempool for hash table values
@@ -46,7 +44,7 @@ static void mempool_init(struct filter_settings* settings) {
 //  Hash table workflow
 //
 
-static struct rte_hash* g_flows;            // hash table
+static struct rte_hash* g_flows;                  // hash table
 static void hashtable_init(struct filter_settings* settings) {
     struct rte_hash_parameters hash_params = {
             .entries = settings->flow_number,
@@ -63,7 +61,7 @@ static void hashtable_init(struct filter_settings* settings) {
 }
 
 struct additional_info_for_new_state {
-    uint8_t direction;
+    uint16_t direction;
     enum HandshakePhase phase;
 };
 static inline struct tcp_flow_state* at_key_or_create(struct tcp_flow_key* key, struct additional_info_for_new_state* i) {
@@ -87,6 +85,7 @@ static inline uint8_t delete_by_key(struct tcp_flow_key* key) {
     struct tcp_flow_state* flow_state;
     if (rte_hash_lookup_data(g_flows, key, (void**)&flow_state) < 0)
         return 0;
+    rte_hash_del_key(g_flows, key);
     free_mem(flow_state);
     return 1;
 }
@@ -105,14 +104,13 @@ static struct rte_hash* fsm_transitions; // Finite state machine
 struct rte_mempool* fsm_states;          // for TCP handshake parsing
 struct fsm_transition {
     enum HandshakePhase phase;
-    uint16_t active_flags;
-    // the first bit for "from client" check
-    // the second bit for SYN
-    // the third bit for RST
-    // the fourth bit for correct seq and ack values check
-    // the fifth bit for ACK
+    ACTIVE_FLAGS_TYPE active_flags;
+    // first 6 bit for tcp flags
+    // 7 bit for direction
+    // 8 bit for chck flag
 };
-static inline void add_new_transition(enum HandshakePhase phase_from, uint16_t flags_from, enum HandshakePhase phase_to) {
+static inline void add_new_transition(enum HandshakePhase phase_from, ACTIVE_FLAGS_TYPE flags_from, enum HandshakePhase phase_to) {
+    // Add new transition to FSM. FROM fstm_transition{phase_from, flags_from} TO phase_to
     struct fsm_transition t = {
             .phase = phase_from,
             .active_flags = flags_from
@@ -135,66 +133,47 @@ static void init_fsm() {
     fsm_states = rte_mempool_create("FSM states", 400,
                                     sizeof(enum HandshakePhase),0, 0, NULL, NULL,
                                     NULL, NULL, (int)rte_socket_id(), 0);
+
     // Logic of handshake parsing
-    add_new_transition(LISTEN, 0x02u + 0x01u, SYN_SENT_INITIATOR);
 
-    add_new_transition(SYN_SENT_INITIATOR, 0x04u, SKIP);
-    add_new_transition(SYN_SENT_INITIATOR, 0x02u + 0x10u, SYN_SENT_RECIPIENT);
-    add_new_transition(SYN_SENT_INITIATOR, 0x02u, SYN_SENT_RECIPIENT_WOT_ACK);
+    add_new_transition(LISTEN, 0x02u + CLNT, SYN_SENT_RECIPIENT);
 
-    add_new_transition(SYN_SENT_RECIPIENT, 0x10u + 0x01u, ESTABLISHED);
-    add_new_transition(SYN_SENT_RECIPIENT_WOT_ACK, 0x010u, SYN_SENT_RECIPIENT);
+    add_new_transition(SYN_SENT_RECIPIENT, 0x02u + CLNT, SYN_SENT_RECIPIENT_LOOP);
+    add_new_transition(SYN_SENT_RECIPIENT, 0x10u + CLNT , ESTABLISHED);
+
+    add_new_transition(SYN_SENT_RECIPIENT_LOOP, 0x02u + CLNT, SYN_SENT_RECIPIENT);
+    add_new_transition(SYN_SENT_RECIPIENT_LOOP, 0x10u + CLNT , ESTABLISHED);
 }
+#ifdef ___DEBUG
 static uint64_t without_transition = 0;
 static uint64_t dropped = 0;
 static uint64_t accepted = 0;
 static uint64_t established = 0;
 static uint64_t lost = 0;
+#endif
 
 static inline uint8_t get_next_state(struct fsm_transition* state) {
+    // Try to get next state by using FSM transitions. Update get state->phase if next state exists and return 1, otherwise 0
     enum HandshakePhase* next_s;
     if (rte_hash_lookup_data(fsm_transitions, state, (void**)&next_s) < 0) {
+#ifdef ___DEBUG
         without_transition++;
         if (state->phase != LISTEN) {
             lost++;
             printf("Phase of lost: %x\nFlags of lost: %x\n\n", state->phase, state->active_flags);
+
         }
+#endif
         return 0;
     }
 
     state->phase = *next_s;
     return 1;
 }
-static inline void get_flags(struct tcp_hdr* header, struct tcp_flags* flags) {
-    // Parse tcp header for tcp flags
-    flags->SYN = header->tcp_flags & 0x02u;
-    flags->ACK = header->tcp_flags & 0x10u;
-    flags->RST = header->tcp_flags & 0x04u;
-}
-void testFSM() {
-    uint16_t f = 4;
-    uint16_t s = 5;
-    uint8_t r = f < s;
-    if (r != 1)
-        rte_exit(EXIT_FAILURE, "TEST FSM FAILED\n\n");
-    uint8_t failed = 0;
-    struct fsm_transition t = {
-            .phase = LISTEN,
-            .active_flags = 0x02u + 0x01u
-    };
-    failed = !get_next_state(&t);
-    t.active_flags = 0x04u;
-    failed = !get_next_state(&t) | failed;
-    failed = get_next_state(&t) | failed;
-    t.phase = SYN_SENT_RECIPIENT;
-    t.active_flags = 0x10u + 0x01u;
-    failed = !get_next_state(&t) | failed;
-    if (failed)
-        rte_exit(EXIT_FAILURE, "TEST FSM FAILED\n\n");
-
-}
 
 static uint8_t analyze_hdr(struct tcp_hdr* tcp_header, struct tcp_flow_key* key, uint8_t direction) {
+    // Package analyzer
+
     struct additional_info_for_new_state i = {
             .direction = direction,
             .phase = LISTEN
@@ -203,24 +182,28 @@ static uint8_t analyze_hdr(struct tcp_hdr* tcp_header, struct tcp_flow_key* key,
 
     // accepted if it was
     if (flow_state->state == ESTABLISHED) {
+#ifdef ___DEBUG
         accepted++;
         established++;
+#endif
         return 1;
     }
-
     // analyze otherwise
-    struct tcp_flags flags;
-    get_flags(tcp_header, &flags);
-    uint8_t clnt = 0x00u;
-    if (flow_state->first_to_second == direction)
-        clnt = 0x01u;
-
     struct fsm_transition t = {
             .phase = flow_state->state,
-            .active_flags = clnt + flags.SYN + flags.RST + flags.ACK
+            .active_flags = (tcp_header->tcp_flags & 0x02u) + // SYN
+                            (tcp_header->tcp_flags & 0x04u) + // ACK
+                            (tcp_header->tcp_flags & 0x10u)   // RST
     };
+    if (flow_state->first_to_second == direction)
+        t.active_flags += CLNT;
+
     if (!get_next_state(&t)) {
+#ifdef ___DEBUG
         dropped++;
+#endif
+        if (flow_state->state == LISTEN)
+            free_mem(flow_state);
         return 0;
     }
 
@@ -231,11 +214,14 @@ static uint8_t analyze_hdr(struct tcp_hdr* tcp_header, struct tcp_flow_key* key,
         update_values(flow_state, tcp_header);
         add_by_key(key, flow_state);
     }
+#ifdef ___DEBUG
     accepted++;
+#endif
     return 1;
 }
 
 uint8_t accept_tcp(struct rte_mbuf* m) {
+    // Parse package and run analyzer for it
     struct ether_hdr* eth_header = rte_pktmbuf_mtod(m, struct ether_hdr*);
 
     struct ipv4_hdr* ip_header = (struct ipv4_hdr*)((char*)eth_header + sizeof(struct ether_hdr));
@@ -263,19 +249,23 @@ uint8_t accept_tcp(struct rte_mbuf* m) {
         key.sIp = src_addr;
         key.sPrt = src_addr;
     }
-
     return analyze_hdr(tcp_header, &key, direction);
 }
 void print_stats() {
+    // Collect all stats for filter. Function for debug
+#ifdef ___DEBUG
     printf("Dropped: %lu\n", dropped);
     printf("Without transition: %lu\n", without_transition);
     printf("Accepted: %lu\n", accepted);
     printf("Established: %lu\n", established);
     printf("Lost: %lu\n", lost);
+#endif
 }
+
+static void RunAllTests ();
+
 void init_filter(struct filter_settings* settings) {
     hashtable_init(settings);
     mempool_init(settings);
     init_fsm();
-    testFSM();
 }
