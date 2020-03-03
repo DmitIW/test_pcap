@@ -1,7 +1,3 @@
-//
-// Created by root on 01.03.2020.
-//
-
 #ifndef TEST_PCAP_FILTER_H
 #define TEST_PCAP_FILTER_H
 

@@ -1,16 +1,14 @@
 #include "filter.h"
-#include <math.h>
 #include "rte_jhash.h"
 
 #define ___DEBUG
 
 enum HandshakePhase {
-    LISTEN = 0x00u,
+    CLOSED = 0x00u,
     SYN_SENT = 0x01u,
-    SYN_SENT_LOOP = 0x02u,
-    PRE_ESTB = 0x03u,
-    PRE_ESTB_LOOP = 0x04u,
-    ESTABLISHED = 0x05u
+    ESTABLISHED = 0x02u,
+    FIN_SENT = 0x03u,
+    FIN_ACK = 0x04u
 };
 struct tcp_flow_key {
     // first ip always smaller as number than second, direction of connect stored in value of hash table
@@ -23,12 +21,11 @@ struct tcp_flow_state {
     enum HandshakePhase state;
     uint16_t first_to_second; // from first ip to second ip in hash key or inverse direction
     uint32_t seq;            // last used seq value
-    uint32_t ack;            // last used ack value
 };
 #define FIN 0x01u
 #define SYN 0x02u
 #define ACK 0x10u
-#define NXT 0x40u
+#define BCKWD 0x80u
 #define ACTIVE_FLAGS_TYPE uint32_t
 
 //
@@ -118,7 +115,6 @@ static inline uint8_t add_by_key(struct tcp_flow_key* key, struct tcp_flow_state
         new_element->state = value->state;
         new_element->seq = value->seq;
         new_element->first_to_second = value->first_to_second;
-        new_element->ack = value->ack;
 
         rte_hash_add_key_data(g_flows, key, new_element);
 
@@ -143,7 +139,6 @@ static inline uint8_t delete_by_key(struct tcp_flow_key* key) {
 
 static inline void update_values(struct tcp_flow_state* state, struct tcp_hdr* hdr) {
     // Update seq and ack values for stored package
-    state->ack = ntohl(hdr->recv_ack);
     state->seq = ntohl(hdr->sent_seq);
 }
 
@@ -151,17 +146,17 @@ static inline void update_values(struct tcp_flow_state* state, struct tcp_hdr* h
 // Algoritm workflow
 //
 
-static struct rte_hash* fsm_transitions; // Finite state machine
-struct rte_mempool* fsm_states;          // for TCP handshake parsing
+
+static struct rte_hash* fsm_transitions = NULL;  // Finite state machine
+struct rte_mempool* fsm_states;                      // for TCP handshake parsing
+
 struct fsm_transition {
     enum HandshakePhase phase;
     ACTIVE_FLAGS_TYPE active_flags;
     // first 6 bit for tcp flags
-    // 7 bit for direction
-    // 8 bit for chck flag
 };
-static inline void add_new_transition(enum HandshakePhase phase_from, ACTIVE_FLAGS_TYPE flags_from, enum HandshakePhase phase_to) {
-    // Add new transition to FSM. FROM fstm_transition{phase_from, flags_from} TO phase_to
+static inline void add_new_transition_fwd(enum HandshakePhase phase_from, ACTIVE_FLAGS_TYPE flags_from, enum HandshakePhase phase_to) {
+    // Add new transition to FSM fwd. FROM fstm_transition_fwd{phase_from, flags_from} TO phase_to
     struct fsm_transition t = {
             .phase = phase_from,
             .active_flags = flags_from
@@ -171,9 +166,27 @@ static inline void add_new_transition(enum HandshakePhase phase_from, ACTIVE_FLA
     *s = phase_to;
     rte_hash_add_key_data(fsm_transitions, &t, s);
 }
+static inline void add_new_transition_bckwd(enum HandshakePhase phase_from, enum HandshakePhase phase_to) {
+    // Add new transition to FSM bckwd. FROM fstm_transition phase_from TO phase_to. For retransmission processing
+    struct fsm_transition t = {
+            .phase = phase_from,
+            .active_flags = BCKWD
+    };
+    enum HandshakePhase* s;
+    rte_mempool_get(fsm_states, (void**)&s);
+    *s = phase_to;
+    rte_hash_add_key_data(fsm_transitions, &t, s);
+}
+static inline void add_new_pass(enum HandshakePhase phase_from, ACTIVE_FLAGS_TYPE flags_from, enum HandshakePhase phase_to) {
+    // Add new forward and backward pass between states in FSM of handshake parsing.
+    // Forward for ordinary handshake way.
+    // Backward for retransmission (repeat of package sent) processing without forgotten current state
+    add_new_transition_fwd(phase_from, flags_from, phase_to);
+    add_new_transition_bckwd(phase_to, phase_from);
+}
 static void init_fsm() {
     struct rte_hash_parameters hash_params = {
-            .entries = 400,
+            .entries = 100,
             .key_len = sizeof(struct fsm_transition),
             .socket_id = (int)rte_socket_id(),
             .hash_func_init_val = 0,
@@ -181,72 +194,99 @@ static void init_fsm() {
     };
     fsm_transitions = rte_hash_create(&hash_params);
     if (fsm_transitions == NULL) { rte_exit(EXIT_FAILURE, "No FSM created\n"); }
-    fsm_states = rte_mempool_create("FSM states", 400,
+
+    fsm_states = rte_mempool_create("FSM states", 20,
                                     sizeof(enum HandshakePhase),0, 0, NULL, NULL,
                                     NULL, NULL, (int)rte_socket_id(), 0);
 
     // Logic of handshake parsing
 
-    add_new_transition(LISTEN, SYN, SYN_SENT);
-
-    add_new_transition(SYN_SENT, ACK + NXT, PRE_ESTB);
-    add_new_transition(SYN_SENT, SYN, SYN_SENT_LOOP);
-
-    add_new_transition(SYN_SENT_LOOP, ACK + NXT, PRE_ESTB);
-    add_new_transition(SYN_SENT_LOOP, SYN, SYN_SENT);
-
-    add_new_transition(PRE_ESTB, ACK + NXT, ESTABLISHED);
-    add_new_transition(PRE_ESTB, ACK, PRE_ESTB_LOOP);
-//    add_new_transition(PRE_ESTB, SYN, SYN_SENT);
-
-    add_new_transition(PRE_ESTB_LOOP, ACK + NXT, ESTABLISHED);
-    add_new_transition(PRE_ESTB_LOOP, ACK, PRE_ESTB);
-//    add_new_transition(PRE_ESTB_LOOP, SYN, SYN_SENT);
+    add_new_pass(CLOSED, SYN, SYN_SENT);
+    add_new_pass(SYN_SENT, ACK, ESTABLISHED);
+    add_new_pass(ESTABLISHED, FIN + ACK, FIN_SENT);
+    add_new_pass(FIN_SENT, ACK, FIN_ACK);
 }
+
 #ifdef ___DEBUG
 static uint64_t without_transition = 0;
 static uint64_t dropped = 0;
 static uint64_t accepted = 0;
 static uint64_t established = 0;
 static uint64_t lost = 0;
+static uint64_t retransmission_like = 0;
+static uint64_t retransmission = 0;
+static uint64_t new_state = 0;
 #endif
 
-static inline uint8_t get_next_state(struct fsm_transition* state) {
-    // Try to get next state by using FSM transitions. Update get state->phase if next state exists and return 1, otherwise 0
-    enum HandshakePhase* next_s;
-    if (rte_hash_lookup_data(fsm_transitions, state, (void**)&next_s) < 0) {
-#ifdef ___DEBUG
-        without_transition++;
-        if (state->phase != LISTEN) {
-            lost++;
-            printf("Phase of lost: %x\nFlags of lost: %x\n\n", state->phase, state->active_flags);
+enum TransitionResult {
+    DROP = 0x00u,
+    RETRANSMISSION = 0x01,
+    ACCEPT = 0x02u
+};
+
+static uint8_t is_retransmission(struct fsm_transition* state) {
+    enum HandshakePhase* tmp;
+    if (rte_hash_lookup_data(fsm_transitions, state, (void**)&tmp) < 0) {
+        struct fsm_transition b_key = {
+                .active_flags = BCKWD,
+                .phase = state->phase
+        };
+        if (rte_hash_lookup_data(fsm_transitions, &b_key, (void**)&tmp) < 0)
+            return 0;
+        else {
+            state->phase = *tmp;
+            is_retransmission(state);
         }
-#endif
-        return 0;
     }
-
-    state->phase = *next_s;
     return 1;
 }
 
-static inline uint32_t nxt_flag(struct tcp_flow_state* flow_state, struct tcp_hdr* tcp_header) {
-    // Check header correct. Return NXT if seq from header equal to seq + 1 from flow_state.
-    if (flow_state->seq + 1 == ntohl(tcp_header->sent_seq))
-        return NXT;
-    return 0x00u;
+static enum TransitionResult get_next_state(struct fsm_transition* state) {
+    // Try to get next state by using FSM transitions. Update get state->phase if next state exists and return 1, otherwise 0
+    enum HandshakePhase* tmp;
+    if (rte_hash_lookup_data(fsm_transitions, state, (void**)&tmp) < 0) {
+        struct fsm_transition b_key = {
+                .active_flags = BCKWD,
+                .phase = state->phase
+        };
+        if (rte_hash_lookup_data(fsm_transitions, &b_key, (void**)&tmp) < 0) {
+#ifdef ___DEBUG
+            without_transition++;
+            if (state->phase != CLOSED) {
+                lost++;
+                printf("Phase of lost: %x\nFlags of lost: %x\n\n", state->phase, state->active_flags);
+            }
+#endif
+            return DROP;
+        }
+        struct fsm_transition prev_state = {
+                .phase = *tmp,
+                .active_flags = state->active_flags
+        };
+#ifdef ___DEBUG
+        retransmission_like++;
+#endif
+        return (enum TransitionResult) is_retransmission(&prev_state);
+    }
+
+    state->phase = *tmp;
+    return ACCEPT;
+}
+
+static inline uint8_t ordinary_msg(struct tcp_flow_state* state, struct tcp_hdr* header) {
+    return (state->state == ESTABLISHED && ((header->tcp_flags & FIN) == 0)) || state->state == FIN_ACK;
 }
 
 static uint8_t analyze_hdr(struct tcp_hdr* tcp_header, struct tcp_flow_key* key, uint8_t direction) {
     // Package analyzer
     struct tcp_flow_state default_value = {
-            .state = LISTEN,
+            .state = CLOSED,
             .first_to_second = direction
     };
-    update_values(&default_value, tcp_header);
     struct tcp_flow_state* flow_state = at_key_or_default(key, &default_value);
 
     // accepted if it was
-    if (flow_state->state == ESTABLISHED) {
+    if (ordinary_msg(flow_state, tcp_header)) {
 #ifdef ___DEBUG
         accepted++;
         established++;
@@ -258,26 +298,36 @@ static uint8_t analyze_hdr(struct tcp_hdr* tcp_header, struct tcp_flow_key* key,
             .phase = flow_state->state,
             .active_flags = (tcp_header->tcp_flags & SYN) +  // SYN
                             (tcp_header->tcp_flags & ACK) +  // ACK
-                            nxt_flag(flow_state, tcp_header) // NXT
+                            (tcp_header->tcp_flags & FIN)    // FIN
     };
 
-    if (!get_next_state(&t)) {
+    switch (get_next_state(&t)) {
+        case DROP : {
 #ifdef ___DEBUG
-        if (t.phase == 3 || t.phase == 4)
-            printf("Port src: %u\nPort dst: %u\n", ntohs(key->sPrt), ntohs(key->fPrt));
-        dropped++;
+            dropped++;
 #endif
-        return 0;
+            return 0;
+        }
+        case RETRANSMISSION : {
+#ifdef ___DEBUG
+            retransmission++;
+            accepted++;
+#endif
+            return 1;
+        }
+        case ACCEPT : {
+            flow_state->state = t.phase;
+            if (flow_state->state == SYN_SENT)
+                add_by_key(key, flow_state);
+#ifdef ___DEBUG
+            accepted++;
+            new_state++;
+#endif
+            return 1;
+        }
+        default:
+            rte_exit(EXIT_FAILURE, "ERROR:: Unconditional state");
     }
-    flow_state->state = t.phase;
-    if (t.active_flags & SYN + t.active_flags & NXT)
-        update_values(flow_state, tcp_header);
-    else if (flow_state->state == SYN_SENT)
-        add_by_key(key, flow_state);
-#ifdef ___DEBUG
-    accepted++;
-#endif
-    return 1;
 }
 
 uint8_t accept_tcp(struct rte_mbuf* m) {
@@ -311,14 +361,19 @@ uint8_t accept_tcp(struct rte_mbuf* m) {
     }
     return analyze_hdr(tcp_header, &key, direction);
 }
+
+
 void print_stats() {
     // Collect all stats for filter. Function for debug
 #ifdef ___DEBUG
     printf("Dropped: %lu\n", dropped);
     printf("Without transition: %lu\n", without_transition);
     printf("Accepted: %lu\n", accepted);
+    printf("New state: %lu\n", new_state);
     printf("Established: %lu\n", established);
     printf("Lost: %lu\n", lost);
+    printf("Retransmission like: %lu\n", retransmission_like);
+    printf("Retransmission: %lu\n", retransmission);
     printf("Hash table size: %lu\n", hash_table_size);
     printf("Hash table; add new element: %lu\n", add_new_element);
     printf("Hash table; return default value: %lu\n", return_default_value);
@@ -329,7 +384,7 @@ void print_stats() {
 static void RunAllTests ();
 
 void init_filter(struct filter_settings* settings) {
+    init_fsm();
     hashtable_init(settings);
     mempool_init(settings);
-    init_fsm();
 }
