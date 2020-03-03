@@ -3,6 +3,10 @@
 
 #define ___DEBUG
 
+//
+//
+//
+
 enum HandshakePhase {
     CLOSED = 0x00u,
     SYN_SENT = 0x01u,
@@ -150,14 +154,14 @@ static inline void update_values(struct tcp_flow_state* state, struct tcp_hdr* h
 static struct rte_hash* fsm_transitions = NULL;  // Finite state machine
 struct rte_mempool* fsm_states;                      // for TCP handshake parsing
 
-struct fsm_transition {
+struct fsm_state {
     enum HandshakePhase phase;
     ACTIVE_FLAGS_TYPE active_flags;
     // first 6 bit for tcp flags
 };
 static inline void add_new_transition_fwd(enum HandshakePhase phase_from, ACTIVE_FLAGS_TYPE flags_from, enum HandshakePhase phase_to) {
     // Add new transition to FSM fwd. FROM fstm_transition_fwd{phase_from, flags_from} TO phase_to
-    struct fsm_transition t = {
+    struct fsm_state t = {
             .phase = phase_from,
             .active_flags = flags_from
     };
@@ -168,7 +172,7 @@ static inline void add_new_transition_fwd(enum HandshakePhase phase_from, ACTIVE
 }
 static inline void add_new_transition_bckwd(enum HandshakePhase phase_from, enum HandshakePhase phase_to) {
     // Add new transition to FSM bckwd. FROM fstm_transition phase_from TO phase_to. For retransmission processing
-    struct fsm_transition t = {
+    struct fsm_state t = {
             .phase = phase_from,
             .active_flags = BCKWD
     };
@@ -187,7 +191,7 @@ static inline void add_new_pass(enum HandshakePhase phase_from, ACTIVE_FLAGS_TYP
 static void init_fsm() {
     struct rte_hash_parameters hash_params = {
             .entries = 100,
-            .key_len = sizeof(struct fsm_transition),
+            .key_len = sizeof(struct fsm_state),
             .socket_id = (int)rte_socket_id(),
             .hash_func_init_val = 0,
             .name = "finite state machine for tcp handshake parsing"
@@ -224,10 +228,10 @@ enum TransitionResult {
     ACCEPT = 0x02u
 };
 
-static uint8_t is_retransmission(struct fsm_transition* state) {
+static uint8_t is_retransmission(struct fsm_state* state) {
     enum HandshakePhase* tmp;
     if (rte_hash_lookup_data(fsm_transitions, state, (void**)&tmp) < 0) {
-        struct fsm_transition b_key = {
+        struct fsm_state b_key = {
                 .active_flags = BCKWD,
                 .phase = state->phase
         };
@@ -241,11 +245,11 @@ static uint8_t is_retransmission(struct fsm_transition* state) {
     return 1;
 }
 
-static enum TransitionResult get_next_state(struct fsm_transition* state) {
+static enum TransitionResult get_next_state(struct fsm_state* state) {
     // Try to get next state by using FSM transitions. Update get state->phase if next state exists and return 1, otherwise 0
     enum HandshakePhase* tmp;
     if (rte_hash_lookup_data(fsm_transitions, state, (void**)&tmp) < 0) {
-        struct fsm_transition b_key = {
+        struct fsm_state b_key = {
                 .active_flags = BCKWD,
                 .phase = state->phase
         };
@@ -259,7 +263,7 @@ static enum TransitionResult get_next_state(struct fsm_transition* state) {
 #endif
             return DROP;
         }
-        struct fsm_transition prev_state = {
+        struct fsm_state prev_state = {
                 .phase = *tmp,
                 .active_flags = state->active_flags
         };
@@ -294,7 +298,7 @@ static uint8_t analyze_hdr(struct tcp_hdr* tcp_header, struct tcp_flow_key* key,
         return 1;
     }
     // analyze otherwise
-    struct fsm_transition t = {
+    struct fsm_state t = {
             .phase = flow_state->state,
             .active_flags = (tcp_header->tcp_flags & SYN) +  // SYN
                             (tcp_header->tcp_flags & ACK) +  // ACK
