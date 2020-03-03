@@ -1,21 +1,20 @@
 #include "filter.h"
 #include "rte_jhash.h"
 
-#define ___DEBUG
+#define ___DEBUG    // Выводит статистику по работе фильтра
 
 //
+// Вспомогательные структуры и типы
 //
-//
-
 enum HandshakePhase {
-    CLOSED = 0x00u,
-    SYN_SENT = 0x01u,
+    CLOSED = 0x00u,         
+    SYN_SENT = 0x01u,       
     ESTABLISHED = 0x02u,
     FIN_SENT = 0x03u,
     FIN_ACK = 0x04u
 };
 struct tcp_flow_key {
-    // first ip always smaller as number than second, direction of connect stored in value of hash table
+    // Инвариант ключа: первый ip всегда меньше второго по значению (позволяет отслеживать прямые и обратные сообщения как один TCP flow)
     uint32_t fIp;   // first ip address
     uint32_t fPrt;  // first port
     uint32_t sIp;   // second ip address
@@ -23,20 +22,15 @@ struct tcp_flow_key {
 };
 struct tcp_flow_state {
     enum HandshakePhase state;
-    uint16_t first_to_second; // from first ip to second ip in hash key or inverse direction
-    uint32_t seq;            // last used seq value
+    uint16_t first_to_second; // Флаг, указывающий кто выступил источником, а кто приемником в самом перво сообщении (с флагом SYN)
+    // uint32_t seq;             
 };
-#define FIN 0x01u
-#define SYN 0x02u
-#define ACK 0x10u
-#define BCKWD 0x80u
-#define ACTIVE_FLAGS_TYPE uint32_t
 
 //
-// Mem operations
+// Операции с памятью в рамках работы с хэш-таблицей
 //
 
-struct rte_mempool* g_tcp_flow_state_pool = NULL;  // mempool for hash table values
+struct rte_mempool* g_tcp_flow_state_pool = NULL;  // mempool для значений из таблицы
 static inline void get_mem(struct tcp_flow_state** object) { rte_mempool_get(g_tcp_flow_state_pool, (void**)object);}
 static inline void free_mem(struct tcp_flow_state* object) { rte_mempool_put(g_tcp_flow_state_pool, object); }
 static void mempool_init(struct filter_settings* settings) {
@@ -47,7 +41,7 @@ static void mempool_init(struct filter_settings* settings) {
 }
 
 //
-//  Hash table workflow
+//  Инициализация хэш-таблицы и функции обертки по работе с ней
 //
 
 #ifdef ___DEBUG
@@ -58,7 +52,7 @@ static uint64_t remove_element = 0;
 #endif
 
 static uint32_t hash_tcp_key(const void* k, uint32_t length, uint32_t initval) {
-    // Compute hash value trough polynomial hash
+    // Полиномиальная хэш-функция от значений адресов и портов участников TCP-flow
     struct tcp_flow_key* key = (struct tcp_flow_key*)k;
     uint32_t frs, scn, trd, frt;
 
@@ -77,7 +71,7 @@ static uint32_t hash_tcp_key(const void* k, uint32_t length, uint32_t initval) {
 
     return v;
 }
-static struct rte_hash* g_flows;                  // hash table
+static struct rte_hash* g_flows;                  // hash-table
 static void hashtable_init(struct filter_settings* settings) {
     struct rte_hash_parameters hash_params = {
             .entries = settings->flow_number,
@@ -88,14 +82,11 @@ static void hashtable_init(struct filter_settings* settings) {
             .name = "tcp flows table"
     };
     g_flows = rte_hash_create(&hash_params);
-    if (g_flows == NULL)
-    {
-        rte_exit(EXIT_FAILURE, "No hash table created\n");
-    }
+    if (g_flows == NULL){ rte_exit(EXIT_FAILURE, "No hash table created\n"); }
 }
 
 static inline struct tcp_flow_state* at_key_or_default(struct tcp_flow_key* key, struct tcp_flow_state* default_value) {
-    // Return value from hash table or return new flow_state value
+    // Возвращает значение по ключу из таблицы или переданное значение по умолчанию.
     struct tcp_flow_state* flow_state;
     if (rte_hash_lookup_data(g_flows, key, (void**)&flow_state) < 0) {
 #ifdef ___DEBUG
@@ -107,7 +98,7 @@ static inline struct tcp_flow_state* at_key_or_default(struct tcp_flow_key* key,
 }
 
 static inline uint8_t add_by_key(struct tcp_flow_key* key, struct tcp_flow_state* value) {
-    // Try to add new value to hash table. Return 1 if adding was successful, 0 otherwise
+    // Добавляет в таблицу значение по ключу. Выделяет память в mempool для постоянного хранения. Возвращает 1 в случае успешного добавления, иначе 0
     struct tcp_flow_state* tmp;
     if (rte_hash_lookup_data(g_flows, key, (void**)&tmp) < 0) {
 #ifdef ___DEBUG
@@ -117,7 +108,7 @@ static inline uint8_t add_by_key(struct tcp_flow_key* key, struct tcp_flow_state
         struct tcp_flow_state* new_element;
         get_mem(&new_element);
         new_element->state = value->state;
-        new_element->seq = value->seq;
+        // new_element->seq = value->seq;
         new_element->first_to_second = value->first_to_second;
 
         rte_hash_add_key_data(g_flows, key, new_element);
@@ -128,7 +119,7 @@ static inline uint8_t add_by_key(struct tcp_flow_key* key, struct tcp_flow_state
 }
 
 static inline uint8_t delete_by_key(struct tcp_flow_key* key) {
-    // Try to delete value by key from hash table and free mem of value. Return 1 if success, 0 otherwise
+    // Удаляет значение по ключу. Высвобождает память из под него в mempool. 1 - значение удалено, 0 - нет.
     struct tcp_flow_state* flow_state;
     if (rte_hash_lookup_data(g_flows, key, (void**)&flow_state) < 0)
         return 0;
@@ -141,26 +132,32 @@ static inline uint8_t delete_by_key(struct tcp_flow_key* key) {
     return 1;
 }
 
-static inline void update_values(struct tcp_flow_state* state, struct tcp_hdr* hdr) {
-    // Update seq and ack values for stored package
-    state->seq = ntohl(hdr->sent_seq);
-}
+// static inline void update_values(struct tcp_flow_state* state, struct tcp_hdr* hdr) {
+//    // Update seq and ack values for stored package
+//    state->seq = ntohl(hdr->sent_seq);
+//}
 
 //
-// Algoritm workflow
+// Конечный автомат распознавания стадий TCP-flow 
 //
 
 
-static struct rte_hash* fsm_transitions = NULL;  // Finite state machine
-struct rte_mempool* fsm_states;                      // for TCP handshake parsing
+static struct rte_hash* fsm_transitions = NULL;      // Конечный автомат
+struct rte_mempool* fsm_states;                      // для распознавания стадий TCP-flow
+
+#define FIN 0x01u
+#define SYN 0x02u
+#define ACK 0x10u
+#define BCKWD 0x80u
+#define ACTIVE_FLAGS_TYPE uint32_t
 
 struct fsm_state {
     enum HandshakePhase phase;
     ACTIVE_FLAGS_TYPE active_flags;
-    // first 6 bit for tcp flags
+    // Флаги для обработки состояний. Могут включать в себя как флаги из TCP заголовка, так и пользовательские флаги.
 };
 static inline void add_new_transition_fwd(enum HandshakePhase phase_from, ACTIVE_FLAGS_TYPE flags_from, enum HandshakePhase phase_to) {
-    // Add new transition to FSM fwd. FROM fstm_transition_fwd{phase_from, flags_from} TO phase_to
+    // Добавить новый прямой переход. От состояния phase_from через флаги flags_from в состояние phase_to.
     struct fsm_state t = {
             .phase = phase_from,
             .active_flags = flags_from
@@ -171,7 +168,7 @@ static inline void add_new_transition_fwd(enum HandshakePhase phase_from, ACTIVE
     rte_hash_add_key_data(fsm_transitions, &t, s);
 }
 static inline void add_new_transition_bckwd(enum HandshakePhase phase_from, enum HandshakePhase phase_to) {
-    // Add new transition to FSM bckwd. FROM fstm_transition phase_from TO phase_to. For retransmission processing
+    // Добавить новый обратный переход. От состояния phase_from через флаг bckwd
     struct fsm_state t = {
             .phase = phase_from,
             .active_flags = BCKWD
@@ -276,6 +273,10 @@ static enum TransitionResult get_next_state(struct fsm_state* state) {
     state->phase = *tmp;
     return ACCEPT;
 }
+
+//
+// Логика обработки пакета
+//
 
 static inline uint8_t ordinary_msg(struct tcp_flow_state* state, struct tcp_hdr* header) {
     return (state->state == ESTABLISHED && ((header->tcp_flags & FIN) == 0)) || state->state == FIN_ACK;
