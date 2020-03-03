@@ -1,20 +1,23 @@
 #include "filter.h"
+#include <math.h>
+#include "rte_jhash.h"
 
-//#define ___DEBUG
+#define ___DEBUG
 
 enum HandshakePhase {
-    LISTEN = 0x00U,
-    SYN_SENT_RECIPIENT = 0x02u,
-    ESTABLISHED = 0x03u,
-    SKIP = 0x04u,
-    SYN_SENT_RECIPIENT_LOOP = 0x07u
+    LISTEN = 0x00u,
+    SYN_SENT = 0x01u,
+    SYN_SENT_LOOP = 0x02u,
+    PRE_ESTB = 0x03u,
+    PRE_ESTB_LOOP = 0x04u,
+    ESTABLISHED = 0x05u
 };
 struct tcp_flow_key {
     // first ip always smaller as number than second, direction of connect stored in value of hash table
     uint32_t fIp;   // first ip address
-    uint16_t fPrt;  // first port
+    uint32_t fPrt;  // first port
     uint32_t sIp;   // second ip address
-    uint16_t sPrt;  // second port
+    uint32_t sPrt;  // second port
 };
 struct tcp_flow_state {
     enum HandshakePhase state;
@@ -22,8 +25,10 @@ struct tcp_flow_state {
     uint32_t seq;            // last used seq value
     uint32_t ack;            // last used ack value
 };
-#define CLNT 0x40u
-#define CHCK 0x80u
+#define FIN 0x01u
+#define SYN 0x02u
+#define ACK 0x10u
+#define NXT 0x40u
 #define ACTIVE_FLAGS_TYPE uint32_t
 
 //
@@ -44,6 +49,33 @@ static void mempool_init(struct filter_settings* settings) {
 //  Hash table workflow
 //
 
+#ifdef ___DEBUG
+static uint64_t hash_table_size = 0;
+static uint64_t return_default_value = 0;
+static uint64_t add_new_element = 0;
+static uint64_t remove_element = 0;
+#endif
+
+static uint32_t hash_tcp_key(const void* k, uint32_t length, uint32_t initval) {
+    // Compute hash value trough polynomial hash
+    struct tcp_flow_key* key = (struct tcp_flow_key*)k;
+    uint32_t frs, scn, trd, frt;
+
+    uint32_t l = sizeof(uint32_t);
+    frs = rte_jhash_32b(&key->fIp, l, initval);
+
+    uint32_t prime_number = 337;
+    scn = rte_jhash_32b(&key->sIp, l, initval) * prime_number;
+
+    prime_number *= prime_number;
+    trd = rte_jhash_32b(&key->fPrt, l, initval) * prime_number;
+
+    prime_number *= prime_number;
+    frt = rte_jhash_32b(&key->sPrt, l, initval) * prime_number;
+    uint32_t v = frs + scn + trd + frt;
+
+    return v;
+}
 static struct rte_hash* g_flows;                  // hash table
 static void hashtable_init(struct filter_settings* settings) {
     struct rte_hash_parameters hash_params = {
@@ -51,6 +83,7 @@ static void hashtable_init(struct filter_settings* settings) {
             .key_len = sizeof(struct tcp_flow_key),
             .socket_id = (int)rte_socket_id(),
             .hash_func_init_val = 0,
+            .hash_func = hash_tcp_key,
             .name = "tcp flows table"
     };
     g_flows = rte_hash_create(&hash_params);
@@ -60,24 +93,38 @@ static void hashtable_init(struct filter_settings* settings) {
     }
 }
 
-struct additional_info_for_new_state {
-    uint16_t direction;
-    enum HandshakePhase phase;
-};
-static inline struct tcp_flow_state* at_key_or_create(struct tcp_flow_key* key, struct additional_info_for_new_state* i) {
+static inline struct tcp_flow_state* at_key_or_default(struct tcp_flow_key* key, struct tcp_flow_state* default_value) {
     // Return value from hash table or return new flow_state value
     struct tcp_flow_state* flow_state;
     if (rte_hash_lookup_data(g_flows, key, (void**)&flow_state) < 0) {
-        get_mem(&flow_state);
-        flow_state->state = i->phase;
-        flow_state->first_to_second = i->direction;
+#ifdef ___DEBUG
+        return_default_value++;
+#endif
+        flow_state = default_value;
     }
     return flow_state;
 }
 
 static inline uint8_t add_by_key(struct tcp_flow_key* key, struct tcp_flow_state* value) {
     // Try to add new value to hash table. Return 1 if adding was successful, 0 otherwise
-    return rte_hash_add_key_data(g_flows, key, value) == 0;
+    struct tcp_flow_state* tmp;
+    if (rte_hash_lookup_data(g_flows, key, (void**)&tmp) < 0) {
+#ifdef ___DEBUG
+        add_new_element++;
+        hash_table_size++;
+#endif
+        struct tcp_flow_state* new_element;
+        get_mem(&new_element);
+        new_element->state = value->state;
+        new_element->seq = value->seq;
+        new_element->first_to_second = value->first_to_second;
+        new_element->ack = value->ack;
+
+        rte_hash_add_key_data(g_flows, key, new_element);
+
+        return 1;
+    }
+    return 0;
 }
 
 static inline uint8_t delete_by_key(struct tcp_flow_key* key) {
@@ -87,13 +134,17 @@ static inline uint8_t delete_by_key(struct tcp_flow_key* key) {
         return 0;
     rte_hash_del_key(g_flows, key);
     free_mem(flow_state);
+#ifdef ___DEBUG
+    hash_table_size--;
+    remove_element--;
+#endif
     return 1;
 }
 
-static inline void update_values(struct tcp_flow_state* values, struct tcp_hdr* new_values) {
+static inline void update_values(struct tcp_flow_state* state, struct tcp_hdr* hdr) {
     // Update seq and ack values for stored package
-    values->ack = htonl(new_values->recv_ack);
-    values->seq = htonl(new_values->sent_seq);
+    state->ack = ntohl(hdr->recv_ack);
+    state->seq = ntohl(hdr->sent_seq);
 }
 
 //
@@ -136,13 +187,21 @@ static void init_fsm() {
 
     // Logic of handshake parsing
 
-    add_new_transition(LISTEN, 0x02u + CLNT, SYN_SENT_RECIPIENT);
+    add_new_transition(LISTEN, SYN, SYN_SENT);
 
-    add_new_transition(SYN_SENT_RECIPIENT, 0x02u + CLNT, SYN_SENT_RECIPIENT_LOOP);
-    add_new_transition(SYN_SENT_RECIPIENT, 0x10u + CLNT , ESTABLISHED);
+    add_new_transition(SYN_SENT, ACK + NXT, PRE_ESTB);
+    add_new_transition(SYN_SENT, SYN, SYN_SENT_LOOP);
 
-    add_new_transition(SYN_SENT_RECIPIENT_LOOP, 0x02u + CLNT, SYN_SENT_RECIPIENT);
-    add_new_transition(SYN_SENT_RECIPIENT_LOOP, 0x10u + CLNT , ESTABLISHED);
+    add_new_transition(SYN_SENT_LOOP, ACK + NXT, PRE_ESTB);
+    add_new_transition(SYN_SENT_LOOP, SYN, SYN_SENT);
+
+    add_new_transition(PRE_ESTB, ACK + NXT, ESTABLISHED);
+    add_new_transition(PRE_ESTB, ACK, PRE_ESTB_LOOP);
+//    add_new_transition(PRE_ESTB, SYN, SYN_SENT);
+
+    add_new_transition(PRE_ESTB_LOOP, ACK + NXT, ESTABLISHED);
+    add_new_transition(PRE_ESTB_LOOP, ACK, PRE_ESTB);
+//    add_new_transition(PRE_ESTB_LOOP, SYN, SYN_SENT);
 }
 #ifdef ___DEBUG
 static uint64_t without_transition = 0;
@@ -161,7 +220,6 @@ static inline uint8_t get_next_state(struct fsm_transition* state) {
         if (state->phase != LISTEN) {
             lost++;
             printf("Phase of lost: %x\nFlags of lost: %x\n\n", state->phase, state->active_flags);
-
         }
 #endif
         return 0;
@@ -171,14 +229,21 @@ static inline uint8_t get_next_state(struct fsm_transition* state) {
     return 1;
 }
 
+static inline uint32_t nxt_flag(struct tcp_flow_state* flow_state, struct tcp_hdr* tcp_header) {
+    // Check header correct. Return NXT if seq from header equal to seq + 1 from flow_state.
+    if (flow_state->seq + 1 == ntohl(tcp_header->sent_seq))
+        return NXT;
+    return 0x00u;
+}
+
 static uint8_t analyze_hdr(struct tcp_hdr* tcp_header, struct tcp_flow_key* key, uint8_t direction) {
     // Package analyzer
-
-    struct additional_info_for_new_state i = {
-            .direction = direction,
-            .phase = LISTEN
+    struct tcp_flow_state default_value = {
+            .state = LISTEN,
+            .first_to_second = direction
     };
-    struct tcp_flow_state* flow_state = at_key_or_create(key, &i);
+    update_values(&default_value, tcp_header);
+    struct tcp_flow_state* flow_state = at_key_or_default(key, &default_value);
 
     // accepted if it was
     if (flow_state->state == ESTABLISHED) {
@@ -191,29 +256,24 @@ static uint8_t analyze_hdr(struct tcp_hdr* tcp_header, struct tcp_flow_key* key,
     // analyze otherwise
     struct fsm_transition t = {
             .phase = flow_state->state,
-            .active_flags = (tcp_header->tcp_flags & 0x02u) + // SYN
-                            (tcp_header->tcp_flags & 0x04u) + // ACK
-                            (tcp_header->tcp_flags & 0x10u)   // RST
+            .active_flags = (tcp_header->tcp_flags & SYN) +  // SYN
+                            (tcp_header->tcp_flags & ACK) +  // ACK
+                            nxt_flag(flow_state, tcp_header) // NXT
     };
-    if (flow_state->first_to_second == direction)
-        t.active_flags += CLNT;
 
     if (!get_next_state(&t)) {
 #ifdef ___DEBUG
+        if (t.phase == 3 || t.phase == 4)
+            printf("Port src: %u\nPort dst: %u\n", ntohs(key->sPrt), ntohs(key->fPrt));
         dropped++;
 #endif
-        if (flow_state->state == LISTEN)
-            free_mem(flow_state);
         return 0;
     }
-
-    if (t.phase == SKIP) {
-        delete_by_key(key);
-    } else {
-        flow_state->state = t.phase;
+    flow_state->state = t.phase;
+    if (t.active_flags & SYN + t.active_flags & NXT)
         update_values(flow_state, tcp_header);
+    else if (flow_state->state == SYN_SENT)
         add_by_key(key, flow_state);
-    }
 #ifdef ___DEBUG
     accepted++;
 #endif
@@ -247,7 +307,7 @@ uint8_t accept_tcp(struct rte_mbuf* m) {
         key.fPrt = dst_port;
 
         key.sIp = src_addr;
-        key.sPrt = src_addr;
+        key.sPrt = src_port;
     }
     return analyze_hdr(tcp_header, &key, direction);
 }
@@ -259,6 +319,10 @@ void print_stats() {
     printf("Accepted: %lu\n", accepted);
     printf("Established: %lu\n", established);
     printf("Lost: %lu\n", lost);
+    printf("Hash table size: %lu\n", hash_table_size);
+    printf("Hash table; add new element: %lu\n", add_new_element);
+    printf("Hash table; return default value: %lu\n", return_default_value);
+    printf("Hash table; remove element: %lu\n", remove_element);
 #endif
 }
 

@@ -14,6 +14,9 @@
 #include <rte_mbuf.h>
 #include <rte_tcp.h>
 #include <rte_ip.h>
+
+#include <stddef.h>
+#include <rte_compat.h>
 #include <rte_hash.h>
 
 struct filter_settings {
