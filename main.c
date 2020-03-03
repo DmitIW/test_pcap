@@ -121,62 +121,56 @@ lcore_main(void)
      * Receive packets on a port and forward them on the paired
      * port.
      */
-    uint32_t common_accepted = 0;
     printf("NB_ports: %u\n", nb_ports);
-    for (port = 0; port < nb_ports - 1; port++) {
+    uint16_t nb_rx;
+    uint16_t port_accepted = 0;
+    uint16_t port_dropped = 1;
+    do {
+        /* Get burst of RX packets, from first port of pair. */
+        struct rte_mbuf *bufs[BURST_SIZE];
+        nb_rx = rte_eth_rx_burst(port_accepted, 0,
+                bufs, BURST_SIZE);
 
-        uint16_t nb_rx;
+        if (unlikely(nb_rx == 0))
+            break;
 
-        do {
-            /* Get burst of RX packets, from first port of pair. */
-            struct rte_mbuf *bufs[BURST_SIZE];
-            nb_rx = rte_eth_rx_burst(port, 0,
-                    bufs, BURST_SIZE);
+        uint16_t accepted = 0;
+        struct rte_mbuf* accepted_bufs[BURST_SIZE];
+        uint16_t dropped = 0;
+        struct rte_mbuf* dropped_buffs[BURST_SIZE];
 
-            if (unlikely(nb_rx == 0))
-                break;
+        for (uint16_t ind = 0; ind < nb_rx; ind++) {
+            struct rte_mbuf* m = bufs[ind];
+            if (accept_tcp(m))
+                accepted_bufs[accepted++] = m;
+            else
+                dropped_buffs[dropped++] = m;
+        }
 
-            uint16_t accepted = 0;
-            struct rte_mbuf* accepted_bufs[BURST_SIZE];
-            uint16_t dropped = 0;
-            struct rte_mbuf* dropped_buffs[BURST_SIZE];
+        /* Send burst of TX packets, to second port of pair. */
+        const uint16_t nb_tx_accepted = rte_eth_tx_burst(port_accepted, 0, accepted_bufs, accepted);
+        const uint16_t nb_tx_dropped = rte_eth_tx_burst(port_dropped, 0, dropped_buffs, dropped);
 
-            for (uint16_t ind = 0; ind < nb_rx; ind++) {
-                struct rte_mbuf* m = bufs[ind];
-                if (accept_tcp(m))
-                    accepted_bufs[accepted++] = m;
-                else
-                    dropped_buffs[dropped++] = m;
-            }
-
-            /* Send burst of TX packets, to second port of pair. */
-            const uint16_t nb_tx = rte_eth_tx_burst(port, 0,
-                    accepted_bufs, accepted);
-
-            const uint16_t nb_tx_dropped = rte_eth_tx_burst(1, 0, dropped_buffs, dropped);
-//            for (uint16_t buf = 0; buf < dropped; buf++)
-//                rte_pktmbuf_free(dropped_buffs[buf]);
-
-            /* Free any unsent packets. */
-            if (unlikely(nb_tx < accepted)) {
-                uint16_t buf;
-                printf("WARNING, not transmitted packets (accepted): %d of %d\n",
-                       nb_tx - accepted,
-                       accepted);
-                for (buf = nb_tx; buf < accepted; buf++)
-                    rte_pktmbuf_free(accepted_bufs[buf]);
-            }
-            if (unlikely(nb_tx_dropped < dropped)) {
-                uint16_t buf;
-                printf("WARNING, not transmitted packets (accepted): %d of %d\n",
-                       nb_tx_dropped - dropped,
-                       dropped);
-                for (buf = nb_tx; buf < dropped; buf++)
-                    rte_pktmbuf_free(dropped_buffs[buf]);
-            }
-        } while (nb_rx);
-        rte_eth_dev_stop(port);
-    }
+        /* Free any unsent packets. */
+        if (unlikely(nb_tx_accepted < accepted)) {
+            uint16_t buf;
+            printf("WARNING, not transmitted packets (accepted): %d of %d\n",
+                   nb_tx_accepted - accepted,
+                   accepted);
+            for (buf = nb_tx_accepted; buf < accepted; buf++)
+                rte_pktmbuf_free(accepted_bufs[buf]);
+        }
+        if (unlikely(nb_tx_dropped < dropped)) {
+            uint16_t buf;
+            printf("WARNING, not transmitted packets (dropped): %d of %d\n",
+                   nb_tx_dropped - dropped,
+                   dropped);
+            for (buf = nb_tx_dropped; buf < dropped; buf++)
+                rte_pktmbuf_free(dropped_buffs[buf]);
+        }
+    } while (nb_rx);
+    rte_eth_dev_stop(port_dropped);
+    rte_eth_dev_stop(port_accepted);
     print_stats();
 }
 
