@@ -161,9 +161,11 @@ static inline void add_new_transition(enum HandshakePhase phase_from, ACTIVE_FLA
     rte_hash_add_key_data(fsm_transitions, &t, s);
 }
 static inline void add_new_path(enum HandshakePhase phase_from, ACTIVE_FLAGS_TYPE flags_from, enum HandshakePhase phase_to) {
-    // Add new forward and backward pass between states in FSM of handshake parsing.
-    // Forward for ordinary handshake way.
-    // Backward for retransmission (repeat of package sent) processing without forgotten current state
+    // Добавляет новые прямой (через флаги flags_from) и обратный (через флаг BCKWD) переходы между phase_from и phase_to
+    // Прямой переход участвует в распознавании корректно идущего (последовательного) TCP-flow
+    // Обратный переход служит для регистрации retransmission
+    
+    // Для каждого TCP-flow запоминается его самая старшая фаза (порядок в структуре HandshakePhase в начале этого файла)
     add_new_transition(phase_from, flags_from, phase_to);
     add_new_transition(phase_to, BCKWD, phase_from);
 }
@@ -182,8 +184,8 @@ static void init_fsm() {
                                     sizeof(enum HandshakePhase),0, 0, NULL, NULL,
                                     NULL, NULL, (int)rte_socket_id(), 0);
 
-    // Logic of handshake parsing
-
+    // Описание связей в конечном автомате: откуда, через какие флаги, куда
+    
     add_new_path(CLOSED, SYN, SYN_SENT);
     add_new_path(SYN_SENT, ACK, ESTABLISHED);
     add_new_path(ESTABLISHED, FIN + ACK, FIN_SENT);
@@ -208,6 +210,7 @@ enum TransitionResult {
 };
 
 static uint8_t is_retransmission(struct fsm_state* state) {
+    // Рекурсивная проверка на то, может ли пакет являться повторением уже полученного 
     enum HandshakePhase* tmp;
     if (rte_hash_lookup_data(fsm_transitions, state, (void**)&tmp) < 0) {
         struct fsm_state b_key = {
@@ -225,7 +228,8 @@ static uint8_t is_retransmission(struct fsm_state* state) {
 }
 
 static enum TransitionResult get_next_state(struct fsm_state* state) {
-    // Try to get next state by using FSM transitions. Update get state->phase if next state exists and return 1, otherwise 0
+    // Получение следующего состояния атомата, если возможно. Возвращает один из трех результатов: DROP, RETRANSMISSION или ACCEPT
+    // В случае ACCEPT значение phase структуры по указателю обновится.
     enum HandshakePhase* tmp;
     if (rte_hash_lookup_data(fsm_transitions, state, (void**)&tmp) < 0) {
         struct fsm_state b_key = {
@@ -261,18 +265,19 @@ static enum TransitionResult get_next_state(struct fsm_state* state) {
 //
 
 static inline uint8_t ordinary_msg(struct tcp_flow_state* state, struct tcp_hdr* header) {
+    // Быстрое подтверждение для пакетов, для которых уже был встречен handshake (условие задания)
     return (state->state == ESTABLISHED && ((header->tcp_flags & FIN) == 0)) || state->state == FIN_ACK;
 }
 
 static uint8_t analyze_hdr(struct tcp_hdr* tcp_header, struct tcp_flow_key* key, uint8_t direction) {
-    // Package analyzer
+    // Анализ одного пакета
     struct tcp_flow_state default_value = {
             .state = CLOSED,
             .first_to_second = direction
     };
     struct tcp_flow_state* flow_state = at_key_or_default(key, &default_value);
 
-    // accepted if it was
+    // Принимаем если был handshake
     if (ordinary_msg(flow_state, tcp_header)) {
 #ifdef ___DEBUG
         accepted++;
@@ -280,7 +285,7 @@ static uint8_t analyze_hdr(struct tcp_hdr* tcp_header, struct tcp_flow_key* key,
 #endif
         return 1;
     }
-    // analyze otherwise
+    // Иначе обрабатываем
     struct fsm_state t = {
             .phase = flow_state->state,
             .active_flags = (tcp_header->tcp_flags & SYN) +  // SYN
@@ -318,7 +323,7 @@ static uint8_t analyze_hdr(struct tcp_hdr* tcp_header, struct tcp_flow_key* key,
 }
 
 uint8_t accept_tcp(struct rte_mbuf* m) {
-    // Parse package and run analyzer for it
+    // Парсинг заголовков и запуск анализатора для пакета
     struct ether_hdr* eth_header = rte_pktmbuf_mtod(m, struct ether_hdr*);
 
     struct ipv4_hdr* ip_header = (struct ipv4_hdr*)((char*)eth_header + sizeof(struct ether_hdr));
@@ -371,6 +376,7 @@ void print_stats() {
 static void RunAllTests ();
 
 void init_filter(struct filter_settings* settings) {
+    // Инициализирует значения для фильтра (hash-table и конечный атомат для парсинга)
     init_fsm();
     hashtable_init(settings);
     mempool_init(settings);
