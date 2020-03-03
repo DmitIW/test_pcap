@@ -23,7 +23,6 @@ struct tcp_flow_key {
 struct tcp_flow_state {
     enum HandshakePhase state;
     uint16_t first_to_second; // Флаг, указывающий кто выступил источником, а кто приемником в самом перво сообщении (с флагом SYN)
-    // uint32_t seq;             
 };
 
 //
@@ -108,7 +107,6 @@ static inline uint8_t add_by_key(struct tcp_flow_key* key, struct tcp_flow_state
         struct tcp_flow_state* new_element;
         get_mem(&new_element);
         new_element->state = value->state;
-        // new_element->seq = value->seq;
         new_element->first_to_second = value->first_to_second;
 
         rte_hash_add_key_data(g_flows, key, new_element);
@@ -132,11 +130,6 @@ static inline uint8_t delete_by_key(struct tcp_flow_key* key) {
     return 1;
 }
 
-// static inline void update_values(struct tcp_flow_state* state, struct tcp_hdr* hdr) {
-//    // Update seq and ack values for stored package
-//    state->seq = ntohl(hdr->sent_seq);
-//}
-
 //
 // Конечный автомат распознавания стадий TCP-flow 
 //
@@ -156,7 +149,7 @@ struct fsm_state {
     ACTIVE_FLAGS_TYPE active_flags;
     // Флаги для обработки состояний. Могут включать в себя как флаги из TCP заголовка, так и пользовательские флаги.
 };
-static inline void add_new_transition_fwd(enum HandshakePhase phase_from, ACTIVE_FLAGS_TYPE flags_from, enum HandshakePhase phase_to) {
+static inline void add_new_transition(enum HandshakePhase phase_from, ACTIVE_FLAGS_TYPE flags_from, enum HandshakePhase phase_to) {
     // Добавить новый прямой переход. От состояния phase_from через флаги flags_from в состояние phase_to.
     struct fsm_state t = {
             .phase = phase_from,
@@ -167,23 +160,12 @@ static inline void add_new_transition_fwd(enum HandshakePhase phase_from, ACTIVE
     *s = phase_to;
     rte_hash_add_key_data(fsm_transitions, &t, s);
 }
-static inline void add_new_transition_bckwd(enum HandshakePhase phase_from, enum HandshakePhase phase_to) {
-    // Добавить новый обратный переход. От состояния phase_from через флаг bckwd
-    struct fsm_state t = {
-            .phase = phase_from,
-            .active_flags = BCKWD
-    };
-    enum HandshakePhase* s;
-    rte_mempool_get(fsm_states, (void**)&s);
-    *s = phase_to;
-    rte_hash_add_key_data(fsm_transitions, &t, s);
-}
-static inline void add_new_pass(enum HandshakePhase phase_from, ACTIVE_FLAGS_TYPE flags_from, enum HandshakePhase phase_to) {
+static inline void add_new_path(enum HandshakePhase phase_from, ACTIVE_FLAGS_TYPE flags_from, enum HandshakePhase phase_to) {
     // Add new forward and backward pass between states in FSM of handshake parsing.
     // Forward for ordinary handshake way.
     // Backward for retransmission (repeat of package sent) processing without forgotten current state
-    add_new_transition_fwd(phase_from, flags_from, phase_to);
-    add_new_transition_bckwd(phase_to, phase_from);
+    add_new_transition(phase_from, flags_from, phase_to);
+    add_new_transition(phase_to, BCKWD, phase_from);
 }
 static void init_fsm() {
     struct rte_hash_parameters hash_params = {
@@ -202,10 +184,10 @@ static void init_fsm() {
 
     // Logic of handshake parsing
 
-    add_new_pass(CLOSED, SYN, SYN_SENT);
-    add_new_pass(SYN_SENT, ACK, ESTABLISHED);
-    add_new_pass(ESTABLISHED, FIN + ACK, FIN_SENT);
-    add_new_pass(FIN_SENT, ACK, FIN_ACK);
+    add_new_path(CLOSED, SYN, SYN_SENT);
+    add_new_path(SYN_SENT, ACK, ESTABLISHED);
+    add_new_path(ESTABLISHED, FIN + ACK, FIN_SENT);
+    add_new_path(FIN_SENT, ACK, FIN_ACK);
 }
 
 #ifdef ___DEBUG
