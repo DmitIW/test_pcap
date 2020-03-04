@@ -373,8 +373,6 @@ void print_stats() {
 #endif
 }
 
-static void RunAllTests ();
-
 void init_filter(struct filter_settings* settings) {
     // Инициализирует значения для фильтра (hash-table и конечный атомат для парсинга)
     init_fsm();
