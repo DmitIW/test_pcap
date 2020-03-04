@@ -266,7 +266,7 @@ static enum TransitionResult get_next_state(struct fsm_state* state) {
 
 static inline uint8_t ordinary_msg(struct tcp_flow_state* state, struct tcp_hdr* header) {
     // Быстрое подтверждение для пакетов, для которых уже был встречен handshake (условие задания)
-    return (state->state == ESTABLISHED && ((header->tcp_flags & FIN) == 0)) || state->state == FIN_ACK;
+    return (state->state == ESTABLISHED && ((header->tcp_flags & FIN) == 0));
 }
 
 static uint8_t analyze_hdr(struct tcp_hdr* tcp_header, struct tcp_flow_key* key, uint8_t direction) {
